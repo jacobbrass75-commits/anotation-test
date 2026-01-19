@@ -1,0 +1,960 @@
+import type { Express, Request, Response } from "express";
+import { projectStorage } from "./projectStorage";
+import { globalSearch, searchProjectDocument } from "./projectSearch";
+import { generateChicagoFootnote, generateChicagoBibliography, generateFootnoteWithQuote, generateInlineCitation } from "./citationGenerator";
+import { generateRetrievalContext, generateProjectContextSummary, generateFolderContextSummary, generateSearchableContent, embedText } from "./contextGenerator";
+import { storage } from "./storage";
+import {
+  getEmbedding,
+  cosineSimilarity,
+  extractCitationMetadata,
+  PIPELINE_CONFIG,
+  getMaxChunksForLevel,
+  type ThoroughnessLevel,
+} from "./openai";
+// V2 Pipeline - improved annotation system
+import { processChunksWithPipelineV2 } from "./pipelineV2";
+import { batchProcess } from "./replit_integrations/batch/utils";
+import {
+  insertProjectSchema,
+  insertFolderSchema,
+  insertProjectDocumentSchema,
+  insertProjectAnnotationSchema,
+  citationDataSchema,
+  batchAnalysisRequestSchema,
+  batchAddDocumentsRequestSchema,
+  type CitationData,
+  type AnnotationCategory,
+  type BatchDocumentResult,
+  type BatchAnalysisResponse,
+  type BatchAddDocumentResult,
+  type BatchAddDocumentsResponse,
+} from "@shared/schema";
+
+interface AnalysisConstraints {
+  categories?: AnnotationCategory[];
+  maxAnnotationsPerDoc?: number;
+  minConfidence?: number;
+  thoroughness?: ThoroughnessLevel;
+}
+
+async function analyzeProjectDocument(
+  projectDocId: string,
+  intent: string,
+  constraints?: AnalysisConstraints
+): Promise<{ annotationsCreated: number; filename: string; chunksAnalyzed: number; totalChunks: number }> {
+  const projectDoc = await projectStorage.getProjectDocument(projectDocId);
+  if (!projectDoc) {
+    throw new Error("Project document not found");
+  }
+
+  const doc = await storage.getDocument(projectDoc.documentId);
+  if (!doc) {
+    throw new Error("Document not found");
+  }
+
+  const project = await projectStorage.getProject(projectDoc.projectId);
+  
+  const fullIntent = project?.thesis 
+    ? `Project thesis: ${project.thesis}\n\nResearch focus: ${intent}`
+    : intent;
+
+  const chunks = await storage.getChunksForDocument(doc.id);
+  if (chunks.length === 0) {
+    throw new Error("No text chunks found for analysis");
+  }
+
+  const thoroughness = constraints?.thoroughness || 'standard';
+  const maxChunks = getMaxChunksForLevel(thoroughness);
+
+  let topChunks: { text: string; startPosition: number; id: string }[];
+  
+  try {
+    const intentEmbedding = await getEmbedding(fullIntent);
+    
+    const chunksWithEmbeddings = await Promise.all(
+      chunks.map(async (chunk) => {
+        if (!chunk.embedding) {
+          try {
+            const embedding = await getEmbedding(chunk.text);
+            await storage.updateChunkEmbedding(chunk.id, embedding);
+            return { ...chunk, embedding };
+          } catch {
+            return chunk;
+          }
+        }
+        return chunk;
+      })
+    );
+
+    const rankedChunks = chunksWithEmbeddings
+      .filter(c => c.embedding)
+      .map((chunk) => ({
+        chunk,
+        similarity: cosineSimilarity(chunk.embedding!, intentEmbedding),
+      }))
+      .sort((a, b) => b.similarity - a.similarity);
+
+    const minSimilarity = thoroughness === 'exhaustive' ? 0.1 : 0.3;
+
+    topChunks = rankedChunks
+      .filter(({ similarity }) => similarity >= minSimilarity)
+      .slice(0, maxChunks)
+      .map(({ chunk }) => ({
+        text: chunk.text,
+        startPosition: chunk.startPosition,
+        id: chunk.id,
+      }));
+      
+    if (topChunks.length === 0) {
+      topChunks = chunks.slice(0, maxChunks)
+        .map(chunk => ({
+          text: chunk.text,
+          startPosition: chunk.startPosition,
+          id: chunk.id,
+        }));
+    }
+  } catch (embeddingError) {
+    console.warn("Embedding-based ranking failed, using document order:", embeddingError);
+    topChunks = chunks.slice(0, maxChunks)
+      .map(chunk => ({
+        text: chunk.text,
+        startPosition: chunk.startPosition,
+        id: chunk.id,
+      }));
+  }
+
+  console.log(`Analyzing ${topChunks.length} of ${chunks.length} chunks (${thoroughness} mode)`);
+
+  const existingAnnotations = await projectStorage.getProjectAnnotationsByDocument(projectDocId);
+  const userAnnotations = existingAnnotations
+    .filter(a => !a.isAiGenerated)
+    .map(a => ({
+      startPosition: a.startPosition,
+      endPosition: a.endPosition,
+      confidenceScore: a.confidenceScore,
+    }));
+
+  for (const ann of existingAnnotations.filter(a => a.isAiGenerated)) {
+    await projectStorage.deleteProjectAnnotation(ann.id);
+  }
+
+  // Use V2 pipeline for improved annotation quality
+  let pipelineAnnotations = await processChunksWithPipelineV2(
+    topChunks,
+    fullIntent,
+    doc.id,
+    doc.fullText,
+    userAnnotations
+  );
+
+  if (constraints?.categories && constraints.categories.length > 0) {
+    pipelineAnnotations = pipelineAnnotations.filter(
+      ann => constraints.categories!.includes(ann.category as AnnotationCategory)
+    );
+  }
+
+  if (constraints?.minConfidence) {
+    pipelineAnnotations = pipelineAnnotations.filter(
+      ann => ann.confidence >= constraints.minConfidence!
+    );
+  }
+
+  if (constraints?.maxAnnotationsPerDoc) {
+    pipelineAnnotations = pipelineAnnotations.slice(0, constraints.maxAnnotationsPerDoc);
+  }
+
+  for (const ann of pipelineAnnotations) {
+    const created = await projectStorage.createProjectAnnotation({
+      projectDocumentId: projectDocId,
+      startPosition: ann.absoluteStart,
+      endPosition: ann.absoluteEnd,
+      highlightedText: ann.highlightText,
+      category: ann.category as AnnotationCategory,
+      note: ann.note,
+      isAiGenerated: true,
+      confidenceScore: ann.confidence,
+    });
+    
+    generateSearchableContent(ann.highlightText, ann.note, ann.category as AnnotationCategory)
+      .then(searchableContent => {
+        projectStorage.updateProjectAnnotation(created.id, { searchableContent });
+      })
+      .catch(err => console.warn("Search indexing failed (non-blocking):", err));
+  }
+
+  return { 
+    annotationsCreated: pipelineAnnotations.length,
+    filename: doc.filename,
+    chunksAnalyzed: topChunks.length,
+    totalChunks: chunks.length,
+  };
+}
+
+export function registerProjectRoutes(app: Express): void {
+  // === PROJECTS ===
+  
+  app.post("/api/projects", async (req: Request, res: Response) => {
+    try {
+      const validated = insertProjectSchema.parse(req.body);
+      const project = await projectStorage.createProject(validated);
+      
+      // Context generation is optional - don't block project creation
+      if (validated.thesis && validated.scope) {
+        try {
+          const contextSummary = await generateProjectContextSummary(validated.thesis, validated.scope, []);
+          // Embeddings may not be available, store context summary without embedding
+          await projectStorage.updateProject(project.id, { contextSummary });
+        } catch (contextError) {
+          console.warn("Context generation failed (non-blocking):", contextError);
+        }
+      }
+      
+      res.status(201).json(project);
+    } catch (error) {
+      console.error("Error creating project:", error);
+      res.status(400).json({ error: "Failed to create project" });
+    }
+  });
+
+  app.get("/api/projects", async (req: Request, res: Response) => {
+    try {
+      const projects = await projectStorage.getAllProjects();
+      res.json(projects);
+    } catch (error) {
+      console.error("Error fetching projects:", error);
+      res.status(500).json({ error: "Failed to fetch projects" });
+    }
+  });
+
+  app.get("/api/projects/:id", async (req: Request, res: Response) => {
+    try {
+      const project = await projectStorage.getProject(req.params.id);
+      if (!project) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+      res.json(project);
+    } catch (error) {
+      console.error("Error fetching project:", error);
+      res.status(500).json({ error: "Failed to fetch project" });
+    }
+  });
+
+  app.put("/api/projects/:id", async (req: Request, res: Response) => {
+    try {
+      const updated = await projectStorage.updateProject(req.params.id, req.body);
+      if (!updated) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+      
+      // Context generation is optional - don't block project update
+      if (req.body.thesis || req.body.scope) {
+        try {
+          const projectDocs = await projectStorage.getProjectDocumentsByProject(req.params.id);
+          const docContexts = projectDocs
+            .map(pd => pd.retrievalContext)
+            .filter((c): c is string => !!c);
+          
+          const contextSummary = await generateProjectContextSummary(
+            updated.thesis || "",
+            updated.scope || "",
+            docContexts
+          );
+          await projectStorage.updateProject(req.params.id, { contextSummary });
+        } catch (contextError) {
+          console.warn("Context generation failed (non-blocking):", contextError);
+        }
+      }
+      
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating project:", error);
+      res.status(500).json({ error: "Failed to update project" });
+    }
+  });
+
+  app.delete("/api/projects/:id", async (req: Request, res: Response) => {
+    try {
+      await projectStorage.deleteProject(req.params.id);
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error deleting project:", error);
+      res.status(500).json({ error: "Failed to delete project" });
+    }
+  });
+
+  // === FOLDERS ===
+
+  app.post("/api/projects/:projectId/folders", async (req: Request, res: Response) => {
+    try {
+      const validated = insertFolderSchema.parse({
+        ...req.body,
+        projectId: req.params.projectId,
+      });
+      const folder = await projectStorage.createFolder(validated);
+      res.status(201).json(folder);
+    } catch (error) {
+      console.error("Error creating folder:", error);
+      res.status(400).json({ error: "Failed to create folder" });
+    }
+  });
+
+  app.get("/api/projects/:projectId/folders", async (req: Request, res: Response) => {
+    try {
+      const folders = await projectStorage.getFoldersByProject(req.params.projectId);
+      res.json(folders);
+    } catch (error) {
+      console.error("Error fetching folders:", error);
+      res.status(500).json({ error: "Failed to fetch folders" });
+    }
+  });
+
+  app.put("/api/folders/:id", async (req: Request, res: Response) => {
+    try {
+      const updated = await projectStorage.updateFolder(req.params.id, req.body);
+      if (!updated) {
+        return res.status(404).json({ error: "Folder not found" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating folder:", error);
+      res.status(500).json({ error: "Failed to update folder" });
+    }
+  });
+
+  app.delete("/api/folders/:id", async (req: Request, res: Response) => {
+    try {
+      await projectStorage.deleteFolder(req.params.id);
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error deleting folder:", error);
+      res.status(500).json({ error: "Failed to delete folder" });
+    }
+  });
+
+  app.put("/api/folders/:id/move", async (req: Request, res: Response) => {
+    try {
+      const { parentFolderId } = req.body;
+      const updated = await projectStorage.moveFolder(req.params.id, parentFolderId || null);
+      if (!updated) {
+        return res.status(404).json({ error: "Folder not found" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error("Error moving folder:", error);
+      res.status(500).json({ error: "Failed to move folder" });
+    }
+  });
+
+  // === PROJECT DOCUMENTS ===
+
+  app.post("/api/projects/:projectId/documents", async (req: Request, res: Response) => {
+    try {
+      const validated = insertProjectDocumentSchema.parse({
+        ...req.body,
+        projectId: req.params.projectId,
+      });
+
+      const projectDoc = await projectStorage.addDocumentToProject(validated);
+
+      // Context and citation generation - don't block document addition
+      try {
+        const doc = await storage.getDocument(validated.documentId);
+        const project = await projectStorage.getProject(req.params.projectId);
+
+        if (doc && project) {
+          // Generate retrieval context
+          const retrievalContext = await generateRetrievalContext(
+            doc.summary || "",
+            doc.mainArguments || [],
+            doc.keyConcepts || [],
+            project.thesis || "",
+            validated.roleInProject || ""
+          );
+
+          // Auto-extract citation metadata using AI
+          let citationData = null;
+          try {
+            citationData = await extractCitationMetadata(doc.fullText);
+            console.log(`[Citation] Auto-extracted citation for ${doc.filename}`);
+          } catch (citationError) {
+            console.warn("Citation extraction failed (non-blocking):", citationError);
+          }
+
+          await projectStorage.updateProjectDocument(projectDoc.id, {
+            retrievalContext,
+            ...(citationData && { citationData }),
+          });
+        }
+      } catch (contextError) {
+        console.warn("Context generation failed (non-blocking):", contextError);
+      }
+
+      res.status(201).json(projectDoc);
+    } catch (error) {
+      console.error("Error adding document to project:", error);
+      res.status(400).json({ error: "Failed to add document to project" });
+    }
+  });
+
+  app.get("/api/projects/:projectId/documents", async (req: Request, res: Response) => {
+    try {
+      const documents = await projectStorage.getProjectDocumentsByProject(req.params.projectId);
+      res.json(documents);
+    } catch (error) {
+      console.error("Error fetching project documents:", error);
+      res.status(500).json({ error: "Failed to fetch project documents" });
+    }
+  });
+
+  app.post("/api/projects/:projectId/documents/batch", async (req: Request, res: Response) => {
+    try {
+      const validated = batchAddDocumentsRequestSchema.parse(req.body);
+      const { documentIds, folderId } = validated;
+      const projectId = req.params.projectId;
+
+      const project = await projectStorage.getProject(projectId);
+      if (!project) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      const existingDocs = await projectStorage.getProjectDocumentsByProject(projectId);
+      const existingDocIds = new Set(existingDocs.map(d => d.documentId));
+
+      const results: BatchAddDocumentResult[] = [];
+      let added = 0;
+      let alreadyExists = 0;
+      let failed = 0;
+
+      for (const documentId of documentIds) {
+        try {
+          const doc = await storage.getDocument(documentId);
+          if (!doc) {
+            results.push({
+              documentId,
+              filename: "Unknown",
+              status: "failed",
+              error: "Document not found",
+            });
+            failed++;
+            continue;
+          }
+
+          if (existingDocIds.has(documentId)) {
+            results.push({
+              documentId,
+              filename: doc.filename,
+              status: "already_exists",
+            });
+            alreadyExists++;
+            continue;
+          }
+
+          const projectDoc = await projectStorage.addDocumentToProject({
+            projectId,
+            documentId,
+            folderId: folderId || null,
+          });
+
+          results.push({
+            documentId,
+            filename: doc.filename,
+            status: "added",
+            projectDocumentId: projectDoc.id,
+          });
+          added++;
+          existingDocIds.add(documentId);
+
+          generateRetrievalContext(
+            doc.summary || "",
+            doc.mainArguments || [],
+            doc.keyConcepts || [],
+            project.thesis || "",
+            ""
+          )
+            .then(retrievalContext => {
+              projectStorage.updateProjectDocument(projectDoc.id, { retrievalContext });
+            })
+            .catch(err => console.warn("Context generation failed (non-blocking):", err));
+        } catch (error) {
+          results.push({
+            documentId,
+            filename: "Unknown",
+            status: "failed",
+            error: error instanceof Error ? error.message : "Unknown error",
+          });
+          failed++;
+        }
+      }
+
+      const response: BatchAddDocumentsResponse = {
+        totalRequested: documentIds.length,
+        added,
+        alreadyExists,
+        failed,
+        results,
+      };
+
+      res.status(201).json(response);
+    } catch (error) {
+      console.error("Error in batch add documents:", error);
+      res.status(400).json({ error: "Failed to add documents" });
+    }
+  });
+
+  app.get("/api/project-documents/:id", async (req: Request, res: Response) => {
+    try {
+      const projectDoc = await projectStorage.getProjectDocument(req.params.id);
+      if (!projectDoc) {
+        return res.status(404).json({ error: "Project document not found" });
+      }
+      res.json(projectDoc);
+    } catch (error) {
+      console.error("Error fetching project document:", error);
+      res.status(500).json({ error: "Failed to fetch project document" });
+    }
+  });
+
+  app.put("/api/project-documents/:id", async (req: Request, res: Response) => {
+    try {
+      const updated = await projectStorage.updateProjectDocument(req.params.id, req.body);
+      if (!updated) {
+        return res.status(404).json({ error: "Project document not found" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating project document:", error);
+      res.status(500).json({ error: "Failed to update project document" });
+    }
+  });
+
+  app.delete("/api/project-documents/:id", async (req: Request, res: Response) => {
+    try {
+      await projectStorage.removeDocumentFromProject(req.params.id);
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error removing document from project:", error);
+      res.status(500).json({ error: "Failed to remove document from project" });
+    }
+  });
+
+  app.put("/api/project-documents/:id/move", async (req: Request, res: Response) => {
+    try {
+      const { folderId } = req.body;
+      const updated = await projectStorage.updateProjectDocument(req.params.id, {
+        folderId: folderId || null,
+      });
+      if (!updated) {
+        return res.status(404).json({ error: "Project document not found" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error("Error moving project document:", error);
+      res.status(500).json({ error: "Failed to move project document" });
+    }
+  });
+
+  app.put("/api/project-documents/:id/citation", async (req: Request, res: Response) => {
+    try {
+      const citationData = citationDataSchema.parse(req.body);
+      const updated = await projectStorage.updateProjectDocument(req.params.id, {
+        citationData,
+      });
+      if (!updated) {
+        return res.status(404).json({ error: "Project document not found" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating citation data:", error);
+      res.status(400).json({ error: "Failed to update citation data" });
+    }
+  });
+
+  // === PROJECT ANNOTATIONS ===
+
+  app.post("/api/project-documents/:id/annotations", async (req: Request, res: Response) => {
+    try {
+      const validated = insertProjectAnnotationSchema.parse({
+        ...req.body,
+        projectDocumentId: req.params.id,
+      });
+      
+      const annotation = await projectStorage.createProjectAnnotation(validated);
+      
+      // Search indexing is optional - don't block annotation creation
+      try {
+        const searchableContent = await generateSearchableContent(
+          validated.highlightedText,
+          validated.note || null,
+          validated.category
+        );
+        await projectStorage.updateProjectAnnotation(annotation.id, {
+          searchableContent,
+        });
+      } catch (indexError) {
+        console.warn("Search indexing failed (non-blocking):", indexError);
+      }
+      
+      res.status(201).json(annotation);
+    } catch (error) {
+      console.error("Error creating project annotation:", error);
+      res.status(400).json({ error: "Failed to create annotation" });
+    }
+  });
+
+  app.get("/api/project-documents/:id/annotations", async (req: Request, res: Response) => {
+    try {
+      const annotations = await projectStorage.getProjectAnnotationsByDocument(req.params.id);
+      res.json(annotations);
+    } catch (error) {
+      console.error("Error fetching project annotations:", error);
+      res.status(500).json({ error: "Failed to fetch annotations" });
+    }
+  });
+
+  app.put("/api/project-annotations/:id", async (req: Request, res: Response) => {
+    try {
+      const updated = await projectStorage.updateProjectAnnotation(req.params.id, req.body);
+      if (!updated) {
+        return res.status(404).json({ error: "Annotation not found" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating project annotation:", error);
+      res.status(500).json({ error: "Failed to update annotation" });
+    }
+  });
+
+  app.delete("/api/project-annotations/:id", async (req: Request, res: Response) => {
+    try {
+      await projectStorage.deleteProjectAnnotation(req.params.id);
+      res.status(204).send();
+    } catch (error) {
+      console.error("Error deleting project annotation:", error);
+      res.status(500).json({ error: "Failed to delete annotation" });
+    }
+  });
+
+  // === AI ANALYSIS ===
+
+  app.post("/api/project-documents/:id/analyze", async (req: Request, res: Response) => {
+    try {
+      const { intent, thoroughness } = req.body;
+      if (!intent || typeof intent !== "string") {
+        return res.status(400).json({ error: "Research intent is required" });
+      }
+
+      const validThoroughness = ['quick', 'standard', 'thorough', 'exhaustive'].includes(thoroughness) 
+        ? thoroughness as ThoroughnessLevel 
+        : 'standard';
+
+      const result = await analyzeProjectDocument(req.params.id, intent, { thoroughness: validThoroughness });
+      const finalAnnotations = await projectStorage.getProjectAnnotationsByDocument(req.params.id);
+      
+      res.json({
+        annotations: finalAnnotations,
+        stats: {
+          chunksAnalyzed: result.chunksAnalyzed,
+          totalChunks: result.totalChunks,
+          annotationsCreated: result.annotationsCreated,
+          coverage: Math.round((result.chunksAnalyzed / result.totalChunks) * 100),
+        }
+      });
+    } catch (error) {
+      console.error("Error analyzing project document:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to analyze document" });
+    }
+  });
+
+  app.post("/api/projects/:projectId/batch-analyze", async (req: Request, res: Response) => {
+    try {
+      const validated = batchAnalysisRequestSchema.parse(req.body);
+      const { projectDocumentIds, intent, thoroughness, constraints } = validated;
+      
+      const startTime = Date.now();
+      const jobId = crypto.randomUUID();
+      
+      const project = await projectStorage.getProject(req.params.projectId);
+      if (!project) {
+        return res.status(404).json({ error: "Project not found" });
+      }
+
+      const results: BatchDocumentResult[] = projectDocumentIds.map(id => ({
+        projectDocumentId: id,
+        filename: "",
+        status: "pending" as const,
+        annotationsCreated: 0,
+      }));
+
+      await batchProcess(
+        projectDocumentIds,
+        async (docId, index) => {
+          try {
+            const result = await analyzeProjectDocument(docId, intent, { 
+              ...constraints, 
+              thoroughness: thoroughness as ThoroughnessLevel 
+            });
+            results[index] = {
+              projectDocumentId: docId,
+              filename: result.filename,
+              status: "completed",
+              annotationsCreated: result.annotationsCreated,
+            };
+          } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : "Unknown error";
+            results[index] = {
+              projectDocumentId: docId,
+              filename: results[index].filename || "Unknown",
+              status: "failed",
+              annotationsCreated: 0,
+              error: errorMsg,
+            };
+          }
+        },
+        { concurrency: 2 }
+      );
+
+      const successfulDocs = results.filter(r => r.status === "completed").length;
+      const failedDocs = results.filter(r => r.status === "failed").length;
+      const totalAnnotations = results.reduce((sum, r) => sum + r.annotationsCreated, 0);
+
+      const response: BatchAnalysisResponse = {
+        jobId,
+        status: failedDocs === 0 ? "completed" : successfulDocs === 0 ? "failed" : "partial",
+        totalDocuments: projectDocumentIds.length,
+        successfulDocuments: successfulDocs,
+        failedDocuments: failedDocs,
+        totalAnnotationsCreated: totalAnnotations,
+        totalTimeMs: Date.now() - startTime,
+        results,
+      };
+
+      res.json(response);
+    } catch (error) {
+      console.error("Error in batch analysis:", error);
+      res.status(500).json({ error: "Failed to process batch analysis" });
+    }
+  });
+
+  // === SEARCH ===
+
+  app.post("/api/projects/:projectId/search", async (req: Request, res: Response) => {
+    try {
+      const { query, filters, limit } = req.body;
+
+      if (!query || typeof query !== "string") {
+        return res.status(400).json({ error: "Query is required" });
+      }
+
+      const results = await globalSearch(req.params.projectId, query, filters, limit);
+      res.json(results);
+    } catch (error) {
+      console.error("Error performing search:", error);
+      res.status(500).json({ error: "Failed to perform search" });
+    }
+  });
+
+  // Search within a single project document
+  app.post("/api/project-documents/:id/search", async (req: Request, res: Response) => {
+    try {
+      const { query } = req.body;
+
+      if (!query || typeof query !== "string") {
+        return res.status(400).json({ error: "Query is required" });
+      }
+
+      const results = await searchProjectDocument(req.params.id, query);
+      res.json(results);
+    } catch (error) {
+      console.error("Error searching project document:", error);
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to search document" });
+    }
+  });
+
+  // === CITATIONS ===
+
+  app.post("/api/citations/generate", async (req: Request, res: Response) => {
+    try {
+      const { citationData, pageNumber, isSubsequent } = req.body;
+      const validated = citationDataSchema.parse(citationData);
+      
+      const footnote = generateChicagoFootnote(validated, pageNumber, isSubsequent);
+      const bibliography = generateChicagoBibliography(validated);
+      
+      res.json({ footnote, bibliography });
+    } catch (error) {
+      console.error("Error generating citation:", error);
+      res.status(400).json({ error: "Failed to generate citation" });
+    }
+  });
+
+  app.post("/api/citations/ai", async (req: Request, res: Response) => {
+    try {
+      const { documentId, highlightedText } = req.body;
+      
+      if (!documentId) {
+        return res.status(400).json({ error: "Document ID is required" });
+      }
+      
+      const document = await storage.getDocument(documentId);
+      if (!document) {
+        return res.status(404).json({ error: "Document not found" });
+      }
+      
+      const citationData = await extractCitationMetadata(document.fullText, highlightedText);
+      
+      if (!citationData) {
+        return res.status(422).json({ 
+          error: "Unable to extract citation metadata from document",
+          footnote: `"${highlightedText?.substring(0, 100) || 'Quote'}..." (Source: ${document.filename})`,
+          bibliography: `${document.filename}. [Citation metadata unavailable]`
+        });
+      }
+      
+      const footnote = generateChicagoFootnote(citationData);
+      const bibliography = generateChicagoBibliography(citationData);
+      
+      res.json({ footnote, bibliography, citationData });
+    } catch (error) {
+      console.error("Error generating AI citation:", error);
+      res.status(500).json({ error: "Failed to generate citation" });
+    }
+  });
+
+  // Generate footnote with embedded quote for an annotation
+  app.post("/api/citations/footnote-with-quote", async (req: Request, res: Response) => {
+    try {
+      const { citationData, quote, pageNumber } = req.body;
+
+      if (!quote) {
+        return res.status(400).json({ error: "Quote text is required" });
+      }
+
+      if (!citationData) {
+        // Fallback if no citation data: return a generic quote format
+        const cleanQuote = quote.trim().replace(/\s+/g, ' ');
+        const displayQuote = cleanQuote.length > 150
+          ? cleanQuote.substring(0, 147) + '...'
+          : cleanQuote;
+        return res.json({
+          footnote: `"${displayQuote}."`,
+          footnoteWithQuote: `"${displayQuote}."`,
+          inlineCitation: "(Source unavailable)",
+          bibliography: "[Citation metadata unavailable]"
+        });
+      }
+
+      const validated = citationDataSchema.parse(citationData);
+
+      const footnote = generateChicagoFootnote(validated, pageNumber);
+      const footnoteWithQuote = generateFootnoteWithQuote(validated, quote, pageNumber);
+      const inlineCitation = generateInlineCitation(validated, pageNumber);
+      const bibliography = generateChicagoBibliography(validated);
+
+      res.json({
+        footnote,
+        footnoteWithQuote,
+        inlineCitation,
+        bibliography
+      });
+    } catch (error) {
+      console.error("Error generating footnote with quote:", error);
+      res.status(400).json({ error: "Failed to generate footnote" });
+    }
+  });
+
+  // Generate footnote for a specific annotation by ID
+  app.post("/api/project-annotations/:id/footnote", async (req: Request, res: Response) => {
+    try {
+      const annotation = await projectStorage.getProjectAnnotation(req.params.id);
+      if (!annotation) {
+        return res.status(404).json({ error: "Annotation not found" });
+      }
+
+      const projectDoc = await projectStorage.getProjectDocument(annotation.projectDocumentId);
+      if (!projectDoc) {
+        return res.status(404).json({ error: "Project document not found" });
+      }
+
+      const { pageNumber } = req.body;
+
+      // Use citation data from the project document
+      const citationData = projectDoc.citationData;
+
+      if (!citationData) {
+        // Try to extract citation on-the-fly
+        const doc = await storage.getDocument(projectDoc.documentId);
+        if (doc) {
+          const extractedCitation = await extractCitationMetadata(doc.fullText, annotation.highlightedText);
+          if (extractedCitation) {
+            // Save for future use
+            await projectStorage.updateProjectDocument(projectDoc.id, { citationData: extractedCitation });
+
+            const footnoteWithQuote = generateFootnoteWithQuote(extractedCitation, annotation.highlightedText, pageNumber);
+            const footnote = generateChicagoFootnote(extractedCitation, pageNumber);
+            const inlineCitation = generateInlineCitation(extractedCitation, pageNumber);
+            const bibliography = generateChicagoBibliography(extractedCitation);
+
+            return res.json({
+              footnote,
+              footnoteWithQuote,
+              inlineCitation,
+              bibliography,
+              citationData: extractedCitation
+            });
+          }
+        }
+
+        // Fallback
+        const cleanQuote = annotation.highlightedText.trim().replace(/\s+/g, ' ');
+        const displayQuote = cleanQuote.length > 150
+          ? cleanQuote.substring(0, 147) + '...'
+          : cleanQuote;
+        const docName = doc?.filename || "Unknown Source";
+
+        return res.json({
+          footnote: `${docName}.`,
+          footnoteWithQuote: `${docName}: "${displayQuote}."`,
+          inlineCitation: `(${docName})`,
+          bibliography: `${docName}. [Citation metadata unavailable]`,
+          citationData: null
+        });
+      }
+
+      const footnoteWithQuote = generateFootnoteWithQuote(citationData as any, annotation.highlightedText, pageNumber);
+      const footnote = generateChicagoFootnote(citationData as any, pageNumber);
+      const inlineCitation = generateInlineCitation(citationData as any, pageNumber);
+      const bibliography = generateChicagoBibliography(citationData as any);
+
+      res.json({
+        footnote,
+        footnoteWithQuote,
+        inlineCitation,
+        bibliography,
+        citationData
+      });
+    } catch (error) {
+      console.error("Error generating annotation footnote:", error);
+      res.status(500).json({ error: "Failed to generate footnote" });
+    }
+  });
+
+  // === STATE PERSISTENCE ===
+
+  app.put("/api/project-documents/:id/view-state", async (req: Request, res: Response) => {
+    try {
+      const { scrollPosition } = req.body;
+      const updated = await projectStorage.updateProjectDocument(req.params.id, {
+        lastViewedAt: new Date(),
+        scrollPosition: scrollPosition || 0,
+      });
+      if (!updated) {
+        return res.status(404).json({ error: "Project document not found" });
+      }
+      res.json(updated);
+    } catch (error) {
+      console.error("Error updating view state:", error);
+      res.status(500).json({ error: "Failed to update view state" });
+    }
+  });
+}
